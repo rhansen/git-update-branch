@@ -1,0 +1,210 @@
+#!/bin/sh
+
+# Copyright (c) 2014, Richard Hansen
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# put all of the logic in a function so that this script can be easily
+# turned into a helper library by removing the last line of this file
+git_update_branch() {
+    # subshell to protect the caller's environment
+    (
+        newline="
+"
+        log_helper() { eval "${log_quiet}" || printf %s "$*"; }
+        log() { log_helper "$*${newline}"; }
+        logn() { log_helper "$*"; }
+        error() { printf %s\\n "ERROR: $@" >&2; }
+        fatal() { error "$@"; exit 1; }
+        try() { "$@" || fatal "'$@' failed"; }
+        usage_fatal() { error "$@"; usage >&2; exit 1; }
+
+        usage() {
+            MYNAME=$(basename "$0") || fatal "basename '$0' failed"
+            case ${MYNAME} in
+                git-update-branch);;
+                *) MYNAME=git_update_branch;;
+            esac
+            cat <<EOF
+Usage:  ${MYNAME} [options] [--] [<branch>...]
+
+Description:
+
+  Performs a fast-forward update of the given branches to the upstream
+  tracking branch.  If no branches are specified, the current branch
+  is updated.
+
+Options:
+
+  -h, --help
+    Print this usage message and exit.
+
+  -a, --all
+    Update all local branches (no branch arguments may be given).
+
+  -q, --quiet
+    Don't print log messages.
+
+  --
+    Treat the remaining arguments as branch names.
+EOF
+        }
+
+        ALL=false
+        log_quiet=false
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                -h|--help) usage; exit 0;;
+                -a|--all) ALL=true;;
+                -q|--quiet) log_quiet=true;;
+                --) shift; break;;
+                *) break;;
+            esac
+            shift
+        done
+        ! eval "${ALL}" || {
+            [ "$#" -eq 0 ] \
+                || usage_fatal "no branches may be given if using '-a'"
+            ALL_BRANCHES=$(git show-ref --heads) \
+                || fatal "unable to get list of branches"
+            set --
+            while IFS= read -r line; do
+                # strip off sha1
+                b=${line#* }
+                # skip non-branches
+                case ${b} in refs/heads/*);; *) continue;; esac
+                # get abbreviated version
+                ba=$(try git rev-parse --abbrev-ref=strict "${b}") || exit 1
+                set -- "$@" "${ba}"
+            done <<EOF
+${ALL_BRANCHES}
+EOF
+        }
+
+        # get the name of the current branch, if applicable
+        unset h
+        ! git symbolic-ref -q HEAD >/dev/null || {
+            h=$(try git symbolic-ref HEAD) || exit 1
+            # default to updating the current branch
+            [ "$#" -gt 0 ] || {
+                ha=$(try git rev-parse --abbrev-ref=strict "${h}") || exit 1
+                set -- "${ha}"
+            }
+        }
+
+        ret=0
+        for raw_b in "$@"; do
+            eval "${ALL}" || logn "Updating ${raw_b}: "
+
+            # get the full branch ref
+            b=$(git rev-parse --symbolic-full-name "${raw_b}") || {
+                error "unknown branch ${raw_b}"
+                ret=$((ret+1))
+                continue
+            }
+
+            # make sure there is only one branch ref
+            num_b=$(printf '%s\n' "${b}" | wc -l)
+            [ "${num_b}" -le 1 ] || {
+                error "ambiguous branch name ${raw_b}"
+                ret=$((ret+1))
+                continue
+            }
+            [ "${num_b}" -ge 1 ] || {
+                error "unknown branch ${raw_b}"
+                ret=$((ret+1))
+                continue
+            }
+
+            # strip off 'refs/heads/' because the '@{u}' suffix
+            # doesn't support it
+            upstream=${b#refs/heads/}@{u}
+
+            has_upstream=true
+            git rev-parse -q --verify "${upstream}" >/dev/null 2>&1 \
+                || has_upstream=false
+
+            # silently skip branches without an upstream if we're
+            # doing all branches
+            ! eval "${ALL}" || {
+                eval "${has_upstream}" || continue
+                logn "Updating ${raw_b}: "
+            }
+
+            # make sure there's an upstream branch
+            eval "${has_upstream}" || {
+                error "no upstream branch found for ${raw_b}"
+                ret=$((ret+1))
+                continue
+            }
+
+            u=$(try git rev-parse --symbolic-full-name "${upstream}") || exit 1
+            u_abbrev=$(try git rev-parse --abbrev-ref=strict "${u}") || exit 1
+
+            # see if the local branch is already ahead of the upstream
+            # branch
+            git merge-base --is-ancestor "${u}" "${b}"; is_ancestor=$?
+            [ "${is_ancestor}" -le 1 ] \
+                || fatal "'git merge-base --is-ancestor ${u} ${b}' failed"
+            [ "${is_ancestor}" -ne 0 ] || {
+                log "Already up-to-date."
+                continue
+            }
+
+            # see if we can fast-forward the branch to the remote revision
+            git merge-base --is-ancestor "${b}" "${u}"; can_ff=$?
+            [ "${can_ff}" -le 1 ] \
+                || fatal "'git merge-base --is-ancestor ${b} ${u}' failed"
+            [ "${can_ff}" -eq 0 ] || {
+                error "${raw_b} can't be fast-forwarded to ${u_abbrev};\
+ branches have diverged"
+                ret=$((ret+1))
+                continue
+            }
+
+            old=$(try git rev-parse --short "${b}") || exit 1
+            new=$(try git rev-parse --short "${u}") || exit 1
+
+            # do a ff merge if we have a working directory and the
+            # branch is currently checked out.
+            is_bare=$(try git rev-parse --is-bare-repository) || exit 1
+            if [ "${is_bare}" = true ] \
+                || [ -z "${h+set}" ] \
+                || [ "${b}" != "${h}" ]
+            then
+                try git update-ref "${b}" "${u}"
+            else
+                try git merge -q --ff-only @{u}
+            fi
+
+            log "${old}..${new}"
+        done
+        exit "${ret}"
+    ) || exit $?
+}
+
+git_update_branch "$@"
